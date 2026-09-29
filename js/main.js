@@ -504,14 +504,20 @@ function onSpeechTick(t) {
 }
 
 function renderLive({ final, interim }) {
-  if (speakPhase !== 'recording') return;
+  if (speakPhase !== 'recording' || !session) return;
   const text = `${final} ${interim}`.trim();
   if (!text) return;
-  const finalHtml = final ? transcriptHTML(final, countFillers(final, FILLER_WORDS).hits).slice(3, -4) : '';
+  // Each recognition segment starts after a pause, which the context rules
+  // ("so" as an opener, etc.) need to know about.
+  const offsets = session.segmentOffsets;
+  const finalHtml = final
+    ? transcriptHTML(final, countFillers(final, FILLER_WORDS, { startOffsets: offsets }).hits).slice(3, -4)
+    : '';
   els.liveTranscript.innerHTML =
     `<p>${finalHtml}${interim ? ` <span class="interim">${esc(interim)}</span>` : ''}</p>`;
   els.liveWords.textContent = String(tokenize(text).length);
-  els.liveFillers.textContent = String(countFillers(text, FILLER_WORDS).total);
+  const liveOffsets = final && interim ? [...offsets, final.length + 1] : offsets;
+  els.liveFillers.textContent = String(countFillers(text, FILLER_WORDS, { startOffsets: liveOffsets }).total);
   els.liveTranscript.scrollTop = els.liveTranscript.scrollHeight;
   updateLiveWpm();
 }
@@ -547,16 +553,16 @@ async function finishSpeech() {
   speakDial.burst();
   chimes.speechDone();
 
-  const transcript = await session.stop();
+  await session.stop();
   if (id !== runId) return;
-  const events = session.events;
+  const { events, segments } = session;
   session = null;
   mic?.close();
   mic = null;
   resetFavicon();
   document.title = BASE_TITLE;
 
-  const stats = analyseSpeech({ transcript, durationMs, levels, events, fillers: FILLER_WORDS });
+  const stats = analyseSpeech({ segments, durationMs, levels, events, fillers: FILLER_WORDS });
   state.result = { stats, levels, events, date: new Date() };
   if (DEV_PREP_SECONDS || DEV_SPEECH_SECONDS) window.__extemporeResult = state.result; // for testing
   renderResults();
@@ -624,10 +630,13 @@ function renderResults() {
   setPill($('#r-pace-pill'), stats.pace);
 
   countUp($('#r-fillers'), stats.fillers.total, { delay: 180 });
+  const possible = stats.fillers.possibleTotal;
   $('#r-fillers-note').textContent = stats.wordCount
-    ? `${stats.fillersPerMin.toFixed(1)} per minute${stats.fillers.counts[0] ? ` · mostly “${stats.fillers.counts[0].phrase}”` : ''}`
+    ? `${stats.fillersPerMin.toFixed(1)} per minute · from the transcript${possible ? ` · ${possible} possible` : ''}`
     : '–';
   setPill($('#r-filler-pill'), stats.fillerRating);
+
+  renderCrutches(stats);
 
   const lp = stats.pauses.longest;
   countUp($('#r-pause'), lp ? lp.duration / 1000 : 0, { decimals: 1, delay: 270 });
@@ -644,16 +653,53 @@ function renderResults() {
       : 'Not enough audio to detect pauses.') + first;
 
   renderFillerBars($('#r-filler-bars'), stats.fillers);
+  $('#r-filler-line').innerHTML = stats.fillers.counts
+    .map((c) => `<span class="${c.possible ? 'possible' : ''}">${esc(c.phrase)} <b>×${c.count}</b>${c.possible ? ' <em>possible</em>' : ''}</span>`)
+    .join('');
   $('#r-transcript').innerHTML = transcriptHTML(stats.transcript, stats.fillers.hits);
   $('#r-transcript-meta').textContent = `${stats.wordCount} words · fillers highlighted`;
 
   // Replay the entrance animations.
-  $$('#screen-results .stat-card, #screen-results .panel').forEach((el) => {
+  $$('#screen-results .stat-card, #screen-results .panel, #screen-results .tip').forEach((el) => {
     el.classList.remove('in');
     void el.offsetWidth;
     el.classList.add('in');
   });
   if (state.screen === 'results') renderTimelineNow();
+}
+
+const secs1 = (ms) => `${(ms / 1000).toFixed(1)} s`;
+
+/** The "estimated from audio" panel and the one-line tip. */
+function renderCrutches(stats) {
+  const ums = stats.likelyUms;
+  countUp($('#r-ums'), ums ? ums.count : 0, { delay: 320 });
+  $('#r-ums').parentElement.classList.toggle('na', !ums);
+  $('#r-ums-note').textContent = !ums
+    ? 'Needs clear microphone audio to estimate'
+    : ums.count
+      ? `${secs1(ums.spans.reduce((a, s) => a + s.duration, 0))} of voice with no words recognised`
+      : 'Every voiced sound turned into words';
+
+  const hes = stats.hesitations;
+  countUp($('#r-hes'), hes ? hes.count : 0, { delay: 380 });
+  $('#r-hes').parentElement.classList.toggle('na', !hes);
+  $('#r-hes-avg').textContent = hes && hes.count ? `avg ${secs1(hes.avgMs)}` : '';
+  $('#r-hes-note').textContent = !hes
+    ? 'Needs clear microphone audio to measure'
+    : 'Silent gaps of 0.4–2 s between words';
+
+  const op = stats.openers;
+  const top = op.flagged[0];
+  $('#r-openers').innerHTML = top
+    ? op.flagged.slice(0, 2).map((f) => `<span>“${esc(f.word)}”</span> <small>×${f.count}</small>`).join('<i>·</i>')
+    : '<span class="ok">None</span>';
+  $('#r-openers').classList.toggle('flag', Boolean(top));
+  $('#r-openers-note').textContent = top
+    ? `${top.count} of your ${op.sentences} sentences start with “${top.word}”`
+    : `No word starts 3+ of your ${op.sentences} sentences`;
+
+  $('#r-tip-text').textContent = stats.tip;
 }
 
 function renderTimelineNow(animate = true) {

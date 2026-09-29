@@ -15,8 +15,13 @@ live and analysed in your browser.
   tab because it ticks from a Web Worker, which Chrome doesn't throttle.
 - **Speech:** a one-minute timer with a live voice visualiser. The transcript appears as you talk,
   with filler words highlighted as they happen.
-- **Analysis (local, no API):** word count, words per minute, filler words (with a breakdown), the
-  longest pause, and a speech timeline showing voice activity, pauses and pace for every 10 seconds.
+- **Analysis (local, no API):**
+  - word count and words per minute;
+  - context-aware filler words, with a breakdown;
+  - *estimated* ums/uhs and hesitations from the mic audio (Chrome deletes ums from transcripts);
+  - repeated sentence openers and the longest pause;
+  - a one-line coaching tip;
+  - a speech timeline showing voice activity, pauses, likely ums and pace for every 10 seconds.
 - **Export:** *Download transcript* saves a `.txt` file with the topic, mode, transcript, stats,
   your prep notes and a suggested prompt. Paste it into Claude for feedback on content accuracy.
 
@@ -57,29 +62,48 @@ on the site's own origin. Nothing else is needed.
 
 | What                               | Where                                            |
 | ---------------------------------- | ------------------------------------------------ |
-| Filler words and phrases           | `FILLER_WORDS` in `js/config.js`                 |
+| Filler words, phrases and rules    | `FILLER_WORDS` at the top of `js/config.js`      |
 | Category weights and colours       | `CATEGORIES` in `js/config.js`                   |
 | Prep and speech durations          | `MODES` and `SPEECH_SECONDS` in `js/config.js`   |
 | Pace bands (slow/ideal/rushed)     | `PACE_BANDS` and `IDEAL_WPM` in `js/config.js`   |
 | Topics                             | `js/topics.js` (one `[area, prompt]` per line)   |
 
-Filler entries can be plain strings (`'basically'`), phrases (`'you know'`), or objects that skip
-obvious non-filler uses based on the word just before them:
+Filler entries are case-insensitive and whole-word. Multi-word phrases are matched first, so
+"okay so" is never also counted as "so". Words that are only fillers in some contexts take a rule:
 
 ```js
-{ phrase: 'like', ignoreAfter: ['looks', 'something', 'behaves'] }  // "looks like a wave" isn't a filler
+{ phrase: 'so', when: 'opener' }   // only at the start of a sentence or after a 0.3 s+ pause
+{ phrase: 'like', when: 'like' }   // not "behaves like a wave", "particles like electrons", "I like"
+{ phrase: 'just', possible: true } // counted, but labelled "possible"
 ```
 
 ## How the analysis works
 
-- **Words per minute** is measured over the time you were actually talking, from the first sound to
-  the last. A slow start or finishing a few seconds early doesn't skew it.
-- **Pauses** are found from the microphone's volume. The page samples the input level every 50 ms,
-  estimates your room's noise floor and your speaking level, and treats stretches below the
-  threshold as silence. It ignores tiny gaps between syllables and silence before your first word.
-  If the mic signal is too flat to read, it falls back to the timing of the recogniser's results.
-- **Filler words** are matched against the transcript. Chrome's recogniser often drops "um" and "uh",
-  so treat those counts as a minimum.
+Chrome's recogniser deletes most "um", "uh", "er" and "hmm" sounds before the page ever sees
+them, so the analysis runs in three layers:
+
+1. **Filler words (text).** These are matched in the transcript using the rules above. Chrome
+   rarely adds punctuation on desktop, so "start of a sentence" means the start of a recognition
+   segment (Chrome closes one each time you pause) or a word that follows a 0.3 s+ silence in the
+   audio.
+2. **Audio (estimated).** The page runs a Web Audio analyser on your mic alongside recognition,
+   sampling speech-band energy (250 Hz–4 kHz) every 50 ms, with auto-gain turned off so quiet
+   pauses stay quiet.
+   - **Pauses and hesitations** are silences in that signal. *Hesitations* are silent gaps of
+     0.4–2 s between your first and last word; longer ones count as long pauses.
+   - **Likely um/uh** is where the mic heard voice but the recogniser returned no words. That
+     covers a voiced stretch between pauses with no words, voice at the start or end of a stretch
+     that no word accounts for, or a long gap in word arrivals while the audio stayed voiced. Each
+     word is matched to the audio using Chrome's measured delay. Hissy sounds (breaths, clicks)
+     are ignored, since "um" is a low murmur. This is a proxy, so it's always labelled
+     "estimated".
+3. **Patterns.** Repeated sentence openers (3+ sentences starting with the same word) and a
+   one-line tip about your biggest crutch.
+
+**Words per minute** is measured over the time you were actually talking, from the first sound to
+the last. If the mic signal is ever too flat to read, pauses fall back to recogniser timing, which
+misses anything under about a second. The results page and the transcript file both say which
+source was used.
 
 ## Project structure
 

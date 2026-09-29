@@ -112,13 +112,16 @@ export function renderTimeline(el, stats, levels, events, { animate = true } = {
     for (let i = 0; i < nBars; i++) values[i] = Math.min(1, values[i] / max + (values[i] ? 0.15 : 0));
   }
   const inPause = (t) => p.pauses.some((q) => t >= q.start && t <= q.end);
+  const umSpans = stats.likelyUms ? stats.likelyUms.spans : [];
+  const inUm = (t) => umSpans.some((q) => t >= q.start && t <= q.end);
   const bars = values.map((v, i) => {
     const h = Math.max(1.5, v * waveAmp);
     const bx = padL + i * (barW + gap);
     const t = (i + 0.5) * binMs;
     const quiet = inPause(t) || t < p.firstSpeech || t > p.lastSpeech;
+    const um = !quiet && inUm(t);
     const delay = reducedMotion() ? 0 : Math.round(i * 5);
-    return `<rect x="${bx}" y="${(waveMid - h).toFixed(1)}" width="${barW}" height="${(h * 2).toFixed(1)}" rx="2" class="tl-bar${quiet ? ' quiet' : ''}" style="animation-delay:${delay}ms"/>`;
+    return `<rect x="${bx}" y="${(waveMid - h).toFixed(1)}" width="${barW}" height="${(h * 2).toFixed(1)}" rx="2" class="tl-bar${quiet ? ' quiet' : um ? ' um' : ''}" style="animation-delay:${delay}ms"/>`;
   }).join('');
 
   const pauseRects = p.pauses.map((q) => {
@@ -193,14 +196,14 @@ export function renderFillerBars(el, fillers) {
     el.innerHTML = `
       <div class="empty-state">
         <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4l4.9 13.6L43 19l-11 9.2L35.6 43 24 35.3 12.4 43 16 28.2 5 19l14.1-1.4z"/></svg>
-        <p>No filler words detected.<br><span>Crisp.</span></p>
+        <p>No filler words in the transcript.<br><span>Crisp.</span></p>
       </div>`;
     return;
   }
   const max = fillers.counts[0].count;
   el.innerHTML = fillers.counts.map((f, i) => `
-    <div class="fbar" style="--d:${reducedMotion() ? 0 : 200 + i * 80}ms">
-      <span class="fbar-label">“${esc(f.phrase)}”</span>
+    <div class="fbar${f.possible ? ' possible' : ''}" style="--d:${reducedMotion() ? 0 : 200 + i * 80}ms">
+      <span class="fbar-label">“${esc(f.phrase)}”${f.possible ? ' <em class="possible-tag">possible</em>' : ''}</span>
       <span class="fbar-track"><span class="fbar-fill" style="--w:${((f.count / max) * 100).toFixed(1)}%"></span></span>
       <span class="fbar-count">${f.count}</span>
     </div>`).join('');
@@ -214,7 +217,7 @@ export function transcriptHTML(text, hits) {
   let pos = 0;
   for (const h of hits) {
     html += esc(text.slice(pos, h.start));
-    html += `<mark class="filler" title="filler: ${esc(h.phrase)}">${esc(text.slice(h.start, h.end))}</mark>`;
+    html += `<mark class="filler${h.possible ? ' possible' : ''}" title="${h.possible ? 'possible filler' : 'filler'}: ${esc(h.phrase)}">${esc(text.slice(h.start, h.end))}</mark>`;
     pos = h.end;
   }
   html += esc(text.slice(pos));

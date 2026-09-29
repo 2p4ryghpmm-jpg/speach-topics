@@ -223,12 +223,42 @@
         </article>
       </div>
 
+      <article class="panel crutch-panel" style="--d:330ms">
+        <header class="panel-head">
+          <h3>Hesitations &amp; crutches</h3>
+          <span class="est-badge" title="Chrome removes “um” and “uh” from transcripts, so these are inferred from your microphone audio">estimated from audio</span>
+        </header>
+        <div class="crutch-grid">
+          <div class="crutch">
+            <div class="crutch-value"><b id="r-ums">0</b></div>
+            <div class="crutch-label">Likely um / uh <em>estimated</em></div>
+            <p class="crutch-note" id="r-ums-note"></p>
+          </div>
+          <div class="crutch">
+            <div class="crutch-value"><b id="r-hes">0</b><small id="r-hes-avg"></small></div>
+            <div class="crutch-label">Hesitations <em>estimated</em></div>
+            <p class="crutch-note" id="r-hes-note"></p>
+          </div>
+          <div class="crutch">
+            <div class="crutch-value crutch-openers" id="r-openers"></div>
+            <div class="crutch-label">Repeated openers</div>
+            <p class="crutch-note" id="r-openers-note"></p>
+          </div>
+        </div>
+      </article>
+
+      <p class="tip" style="--d:400ms">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1.1 2V16h5v-.2c.1-.8.5-1.5 1.1-2A6 6 0 0 0 12 3z"/></svg>
+        <span id="r-tip-text"></span>
+      </p>
+
       <article class="panel timeline-panel" style="--d:360ms">
         <header class="panel-head">
           <h3>Speech timeline</h3>
           <div class="legend">
             <span><i class="lg-voice"></i>voice</span>
             <span><i class="lg-pause"></i>pause</span>
+            <span><i class="lg-um"></i>likely um</span>
             <span><i class="lg-pace"></i>pace per 10 s</span>
           </div>
         </header>
@@ -238,9 +268,10 @@
 
       <div class="results-grid">
         <article class="panel" style="--d:450ms">
-          <header class="panel-head"><h3>Filler breakdown</h3></header>
+          <header class="panel-head"><h3>Filler words (text)</h3></header>
+          <p class="breakdown-line" id="r-filler-line"></p>
           <div id="r-filler-bars"></div>
-          <p class="fine">Chrome sometimes drops “um” and “uh” from transcripts, so treat those counts as a minimum.</p>
+          <p class="fine">“So”, “well”, “okay” and “right” count only at the start of a sentence or after a pause. “Like” counts only when it isn’t introducing a noun (“like a wave”) or used as a verb. Chrome removes “um” and “uh” from the text, so those are estimated from audio above.</p>
         </article>
         <article class="panel transcript-panel" style="--d:540ms">
           <header class="panel-head"><h3>Transcript</h3><span class="muted" id="r-transcript-meta"></span></header>

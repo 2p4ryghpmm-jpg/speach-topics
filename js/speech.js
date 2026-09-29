@@ -6,6 +6,8 @@
  * transparently restart it and stitch the transcript together.
  */
 
+import { joinSegments } from './analysis.js';
+
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 export const speechSupported = () => Boolean(SR);
@@ -26,7 +28,8 @@ export class SpeechSession {
     this.lang = lang;
     this.onUpdate = onUpdate;
     this.onError = onError;
-    this.finalParts = [];
+    this.segments = []; // [{ text, start, end }], one per final recognition result
+    this.segStart = null;
     this.interim = '';
     this.events = [];
     this.active = false;
@@ -37,7 +40,7 @@ export class SpeechSession {
   }
 
   get finalText() {
-    return this.finalParts.join(' ').replace(/\s+/g, ' ').trim();
+    return joinSegments(this.segments).text;
   }
 
   get text() {
@@ -58,17 +61,19 @@ export class SpeechSession {
     rec.maxAlternatives = 1;
 
     rec.onresult = (e) => {
+      const now = performance.now() - this.t0;
       // Finals before resultIndex were already delivered; interim text is rebuilt each time.
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) this.finalParts.push(e.results[i][0].transcript.trim());
+        if (e.results[i].isFinal) this._pushSegment(e.results[i][0].transcript, now);
       }
       let interim = '';
       for (let i = 0; i < e.results.length; i++) {
         if (!e.results[i].isFinal) interim += e.results[i][0].transcript;
       }
       this.interim = interim.trim();
+      if (this.interim && this.segStart == null) this.segStart = now;
       const words = (this.text.match(/\S+/g) || []).length;
-      this.events.push({ t: performance.now() - this.t0, words });
+      this.events.push({ t: now, words });
       this.onUpdate?.({ final: this.finalText, interim: this.interim });
     };
 
@@ -109,17 +114,29 @@ export class SpeechSession {
   /** Forget anything heard so far and re-base timestamps (used at "go"). */
   reset(t0 = performance.now()) {
     this.t0 = t0;
-    this.finalParts = [];
+    this.segments = [];
+    this.segStart = null;
     this.interim = '';
     this.events = [];
   }
 
+  _pushSegment(text, now) {
+    const t = text.trim();
+    if (t) this.segments.push({ text: t, start: this.segStart ?? now, end: now });
+    this.segStart = null;
+  }
+
   _commitInterim() {
     if (this.interim) {
-      this.finalParts.push(this.interim);
+      this._pushSegment(this.interim, performance.now() - this.t0);
       this.interim = '';
       this.onUpdate?.({ final: this.finalText, interim: '' });
     }
+  }
+
+  /** Character offsets where each segment starts in `finalText`. */
+  get segmentOffsets() {
+    return joinSegments(this.segments).offsets;
   }
 
   /** Stop listening; resolves once Chrome has delivered its final results. */

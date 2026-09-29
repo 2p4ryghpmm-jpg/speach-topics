@@ -1,5 +1,11 @@
 /*
  * Local, offline speech analysis. Pure functions — no DOM, no network.
+ *
+ * Three layers:
+ *  1. Text fillers   — matched in the transcript, with context rules.
+ *  2. Audio          — pauses, hesitations and "likely um/uh" estimated from
+ *                      microphone levels, because Chrome deletes ums from the text.
+ *  3. Patterns       — repeated sentence openers and a one-line tip.
  */
 import { PACE_BANDS } from './config.js';
 
@@ -17,6 +23,75 @@ export function tokenize(text) {
   return out;
 }
 
+/**
+ * Join recognition segments into one transcript.
+ * Returns the text and the character offset where each segment starts.
+ */
+export function joinSegments(segments) {
+  let text = '';
+  const offsets = [];
+  for (const seg of segments || []) {
+    const t = String(seg.text || '').replace(/\s+/g, ' ').trim();
+    if (!t) continue;
+    if (text) text += ' ';
+    offsets.push(text.length);
+    text += t;
+  }
+  return { text, offsets };
+}
+
+/**
+ * Token indices that begin a sentence: the first word, anything after . ? !,
+ * and the first word of each recognition segment (Chrome closes a segment
+ * when you pause, and rarely adds punctuation on desktop).
+ */
+export function sentenceStarts(text, tokens, startOffsets = []) {
+  const starts = new Set();
+  if (!tokens.length) return starts;
+  starts.add(0);
+  for (let i = 1; i < tokens.length; i++) {
+    if (/[.?!]/.test(text.slice(tokens[i - 1].end, tokens[i].start))) starts.add(i);
+  }
+  const offsets = [...startOffsets].sort((a, b) => a - b);
+  let j = 0;
+  for (const off of offsets) {
+    while (j < tokens.length && tokens[j].start < off) j++;
+    if (j < tokens.length) starts.add(j);
+  }
+  return starts;
+}
+
+/* ───────────── Layer 1: text fillers ───────────── */
+
+// "like" is a comparison or a verb after these words: "looks like", "I like", "would like".
+const LIKE_NOT_AFTER = new Set([
+  'look', 'looks', 'looked', 'looking', 'seem', 'seems', 'seemed', 'sound', 'sounds', 'sounded',
+  'feel', 'feels', 'felt', 'behave', 'behaves', 'behaved', 'behaving', 'act', 'acts', 'acted',
+  'something', 'anything', 'nothing', 'everything', 'things', 'stuff', 'exactly', 'just', 'much',
+  'more', 'less', 'very', 'not', 'shaped', 'i', 'you', 'we', 'they', 'he', 'she', 'would',
+  "i'd", "you'd", "we'd", "they'd", "don't", "didn't", "doesn't", 'do', 'does', 'did', 'to',
+]);
+// …and it introduces a noun phrase when followed by these: "like a wave", "like this", "like two".
+const NOUN_PHRASE_START = new Set([
+  'a', 'an', 'the', 'this', 'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our',
+  'their', 'some', 'any', 'each', 'every', 'all', 'both', 'one', 'two', 'three', 'four', 'five',
+  'ten', 'hundred', 'thousand', 'million', 'me', 'him', 'us', 'them', 'it', 'someone', 'something',
+  'anything', 'everything', 'people', 'most', 'many', 'other', 'another', 'what', 'how',
+]);
+// Words ending in "s" that aren't plural nouns (so "was like" can still be a filler).
+const NOT_PLURAL = new Set(['was', 'is', 'has', 'does', 'this', 'his', 'its', 'us', 'yes', 'as', 'thus', 'plus', 'always', 'perhaps', 'sometimes', 'unless', 'whereas', 'across', 'less', 'guess']);
+
+function isFillerLike(tokens, i) {
+  const prev = tokens[i - 1]?.word;
+  const next = tokens[i + 1]?.word;
+  if (next === 'you' && tokens[i + 2]?.word === 'know') return true; // "like, you know"
+  if (prev && LIKE_NOT_AFTER.has(prev)) return false;
+  // "particles like electrons", "languages like Python": a plural noun before it.
+  if (prev && /^[a-z]{3,}[^s]s$/.test(prev) && !NOT_PLURAL.has(prev)) return false;
+  if (next && (NOUN_PHRASE_START.has(next) || /^\d/.test(next))) return false;
+  return true;
+}
+
 function normaliseFillers(list) {
   return list
     .map((f) => (typeof f === 'string' ? { phrase: f } : f))
@@ -24,19 +99,24 @@ function normaliseFillers(list) {
       phrase: f.phrase.toLowerCase().trim(),
       parts: tokenize(f.phrase).map((t) => t.word),
       ignoreAfter: new Set((f.ignoreAfter || []).map(norm)),
+      when: f.when || null,
+      possible: Boolean(f.possible),
     }))
     .filter((f) => f.parts.length)
-    // Longer phrases first so "you know" isn't also counted as something shorter.
+    // Longer phrases first, so "okay so" is never also counted as "so".
     .sort((a, b) => b.parts.length - a.parts.length);
 }
 
 /**
  * Count filler words/phrases.
- * Returns { total, counts: [{phrase, count}], hits: [{start, end, phrase}] }
- * where start/end are character offsets into the original text.
+ * opts.startOffsets — character offsets where recognition segments begin
+ * opts.pauseBefore  — token indices preceded by a pause of 0.3 s or more
+ * Returns { total, possibleTotal, counts: [{phrase, count, possible}],
+ *           hits: [{start, end, phrase, possible}] } (character offsets).
  */
-export function countFillers(text, fillerList) {
+export function countFillers(text, fillerList, { startOffsets = [], pauseBefore = new Set() } = {}) {
   const tokens = tokenize(text);
+  const starts = sentenceStarts(text, tokens, startOffsets);
   const fillers = normaliseFillers(fillerList);
   const used = new Array(tokens.length).fill(false);
   const counts = new Map();
@@ -51,19 +131,50 @@ export function countFillers(text, fillerList) {
       }
       if (!match) continue;
       if (i > 0 && f.ignoreAfter.has(tokens[i - 1].word)) continue;
+      if (f.when === 'opener' && !starts.has(i) && !pauseBefore.has(i)) continue;
+      if (f.when === 'like' && !isFillerLike(tokens, i)) continue;
       for (let k = 0; k < n; k++) used[i + k] = true;
-      counts.set(f.phrase, (counts.get(f.phrase) || 0) + 1);
-      hits.push({ start: tokens[i].start, end: tokens[i + n - 1].end, phrase: f.phrase });
+      const c = counts.get(f.phrase) || { phrase: f.phrase, count: 0, possible: f.possible };
+      c.count++;
+      counts.set(f.phrase, c);
+      hits.push({ start: tokens[i].start, end: tokens[i + n - 1].end, phrase: f.phrase, possible: f.possible });
       i += n - 1;
     }
   }
 
   hits.sort((a, b) => a.start - b.start);
-  const list = [...counts.entries()]
-    .map(([phrase, count]) => ({ phrase, count }))
-    .sort((a, b) => b.count - a.count || a.phrase.localeCompare(b.phrase));
-  return { total: hits.length, counts: list, hits };
+  const list = [...counts.values()].sort((a, b) => b.count - a.count || a.phrase.localeCompare(b.phrase));
+  return {
+    total: hits.length,
+    possibleTotal: hits.filter((h) => h.possible).length,
+    counts: list,
+    hits,
+  };
 }
+
+/* ───────────── Layer 3: sentence openers ───────────── */
+
+// Natural ways to start a sentence that aren't worth flagging.
+const OPENER_IGNORE = new Set(['the', 'a', 'an', 'it', 'this', 'that', 'there', 'i', 'we', 'you', 'they', 'he', 'she']);
+
+/** Words that start 3+ sentences, e.g. [{ word: 'so', count: 5 }]. */
+export function repeatedOpeners(text, startOffsets = [], { min = 3 } = {}) {
+  const tokens = tokenize(text);
+  const starts = sentenceStarts(text, tokens, startOffsets);
+  const counts = new Map();
+  for (const i of starts) {
+    const w = tokens[i]?.word;
+    if (!w || OPENER_IGNORE.has(w)) continue;
+    counts.set(w, (counts.get(w) || 0) + 1);
+  }
+  const flagged = [...counts.entries()]
+    .filter(([, c]) => c >= min)
+    .map(([word, count]) => ({ word, count }))
+    .sort((a, b) => b.count - a.count);
+  return { sentences: starts.size, flagged };
+}
+
+/* ───────────── Layer 2: audio ───────────── */
 
 function percentile(sorted, p) {
   if (!sorted.length) return 0;
@@ -72,25 +183,31 @@ function percentile(sorted, p) {
 }
 
 /**
- * Voice-activity based pause detection from microphone level samples.
- * samples: [{ t: ms since speech start, db: dBFS level }]
+ * Voice-activity detection from microphone level samples.
+ * samples: [{ t: ms since speech start, db: speech-band level in dB }]
  * Returns null when the signal is too flat to separate speech from silence.
  */
 export function analysePausesFromLevels(samples, durationMs, opts = {}) {
   const { minGapMs = 250, minBlipMs = 120, minPauseMs = 400 } = opts;
   if (!samples || samples.length < 20) return null;
 
-  const dbs = samples.map((s) => s.db).filter(Number.isFinite).sort((a, b) => a - b);
-  const floor = percentile(dbs, 0.1);
-  const peak = percentile(dbs, 0.95);
+  const all = samples.map((s) => (Number.isFinite(s.db) ? s.db : -140)).sort((a, b) => a - b);
+  // Near-digital silence (noise suppression, muted input) always counts as silence,
+  // but it shouldn't drag the noise-floor estimate down to nothing.
+  const live = all.filter((d) => d > -110);
+  const basis = live.length >= all.length * 0.1 ? live : all;
+  const floor = percentile(basis, 0.1);
+  const peak = percentile(basis, 0.95);
   const range = peak - floor;
   if (range < 10) return null;
-  const threshold = floor + Math.max(6, range * 0.3);
+  // Speech sits within ~24 dB of its own peaks; room noise usually doesn't.
+  let threshold = Math.max(floor + range * 0.3, peak - 24);
+  threshold = Math.max(floor + 6, Math.min(threshold, peak - 10));
 
-  // Build speech/silence runs.
   const runs = [];
   for (let i = 0; i < samples.length; i++) {
-    const speaking = samples[i].db > threshold;
+    const db = Number.isFinite(samples[i].db) ? samples[i].db : -140;
+    const speaking = db > threshold;
     const t = samples[i].t;
     const next = i + 1 < samples.length ? samples[i + 1].t : Math.max(t, durationMs);
     const last = runs[runs.length - 1];
@@ -125,36 +242,22 @@ export function analysePausesFromLevels(samples, durationMs, opts = {}) {
     .filter((p) => p.duration >= minPauseMs);
 
   const longest = pauses.reduce((best, p) => (!best || p.duration > best.duration ? p : best), null);
-  return {
-    source: 'audio',
-    threshold,
-    floor,
-    peak,
-    firstSpeech,
-    lastSpeech,
-    pauses,
-    longest,
-    runs: smooth,
-  };
+  return { source: 'audio', threshold, floor, peak, firstSpeech, lastSpeech, pauses, longest, runs: smooth };
 }
 
 /**
- * Fallback pause detection from recogniser result timestamps.
- * events: [{ t, words }] — one per recognition result event.
+ * Last-resort pause estimate from recogniser result timing, used only when the
+ * microphone levels are unusable. Chrome batches results, so this misses short
+ * pauses and is labelled as an estimate in the UI.
  */
 export function analysePausesFromEvents(events, durationMs, opts = {}) {
-  const { minPauseMs = 1200 } = opts;
+  const { minPauseMs = 1000 } = opts;
   const active = events.filter((e, i) => i === 0 || e.words !== events[i - 1].words);
   if (!active.length) return null;
-  // Recognition results trail the audio by roughly half a second.
-  const lag = 500;
   const pauses = [];
   for (let i = 1; i < active.length; i++) {
     const gap = active[i].t - active[i - 1].t;
-    if (gap >= minPauseMs) {
-      const start = Math.max(0, active[i - 1].t - lag);
-      pauses.push({ start, end: start + gap - lag, duration: gap - lag });
-    }
+    if (gap >= minPauseMs) pauses.push({ start: active[i - 1].t, end: active[i].t, duration: gap });
   }
   const longest = pauses.reduce((best, p) => (!best || p.duration > best.duration ? p : best), null);
   return {
@@ -166,6 +269,133 @@ export function analysePausesFromEvents(events, durationMs, opts = {}) {
     runs: null,
   };
 }
+
+/** Recogniser events where the running word count grew: [{ t, n, index }]. */
+function wordIncrements(events) {
+  const out = [];
+  let max = 0;
+  for (const e of events) {
+    if (e.words > max) { out.push({ t: e.t, n: e.words - max, index: max }); max = e.words; }
+  }
+  return out;
+}
+
+/**
+ * Chrome reports words some time after they're spoken. Measure that delay at
+ * clean speech onsets: after the lead-in silence (or any pause of 1 s+) the
+ * first word to arrive belongs to the speech that just started.
+ */
+export function calibrateLatency(incs, runs) {
+  const deltas = [];
+  runs.forEach((r, i) => {
+    const clean = !r.speaking && (i === 0 || r.end - r.start >= 1000);
+    if (!clean || i === runs.length - 1) return;
+    const e = incs.find((x) => x.t > r.end);
+    if (e && e.t - r.end < 2500) deltas.push(e.t - r.end);
+  });
+  if (!deltas.length) return 600;
+  deltas.sort((a, b) => a - b);
+  return Math.min(1500, Math.max(150, deltas[Math.floor((deltas.length - 1) / 2)]));
+}
+
+/**
+ * Attribute recognised words to the voiced stretch of audio they came from.
+ * Returns { latency, runs: [{ start, end, silenceBefore, arrivals: [{t, n, index}] }] }.
+ */
+export function alignWordsToAudio(events, pauses) {
+  if (pauses.source !== 'audio') return null;
+  const incs = wordIncrements(events);
+  const latency = calibrateLatency(incs, pauses.runs);
+  const runs = [];
+  let lastEnd = 0;
+  for (const r of pauses.runs) {
+    if (!r.speaking) continue;
+    runs.push({ start: r.start, end: r.end, silenceBefore: r.start - lastEnd, arrivals: [] });
+    lastEnd = r.end;
+  }
+  if (!runs.length) return null;
+  for (const inc of incs) {
+    const spoken = inc.t - latency;
+    let idx = 0;
+    for (let i = 0; i < runs.length && runs[i].start <= spoken + 250; i++) idx = i;
+    runs[idx].arrivals.push(inc);
+  }
+  return { latency, runs };
+}
+
+/** Index of each word that follows a silence of at least `minGapMs`. */
+export function wordsAfterPause(alignment, { minGapMs = 300 } = {}) {
+  const out = new Set();
+  if (!alignment) return out;
+  for (const r of alignment.runs) {
+    if (r.arrivals.length && r.silenceBefore >= minGapMs) out.add(r.arrivals[0].index);
+  }
+  return out;
+}
+
+/** Silent gaps of 0.4–2 s between the first and last word. */
+export function findHesitations(pauses, { minMs = 400, maxMs = 2000 } = {}) {
+  const gaps = pauses.pauses.filter((p) => p.duration >= minMs && p.duration <= maxMs);
+  const avgMs = gaps.length ? gaps.reduce((s, g) => s + g.duration, 0) / gaps.length : 0;
+  return { count: gaps.length, avgMs, gaps };
+}
+
+/**
+ * Likely "um"/"uh": the mic heard voice, but the recogniser produced no words
+ * for it. Chrome filters these sounds out of the transcript, so this is an
+ * estimate, not a count. Three cases:
+ *   • a voiced stretch between pauses with no words at all ("… [pause] ummm [pause] …")
+ *   • voice at the start or end of a stretch that no word accounts for
+ *   • a long gap between word arrivals while the audio stayed voiced
+ */
+export function estimateLikelyUms(levels, alignment, opts = {}) {
+  const { minMs = 300, maxMs = 2500, edgeMs = 450, wordMs = 350 } = opts;
+  if (!alignment) return null;
+  const { latency, runs } = alignment;
+  const totalWords = runs.reduce((a, r) => a + r.arrivals.reduce((b, x) => b + x.n, 0), 0);
+  if (totalWords < 5) return null;
+
+  // Typical spacing between word arrivals while talking.
+  const gaps = [];
+  for (const r of runs) for (let k = 1; k < r.arrivals.length; k++) gaps.push(r.arrivals[k].t - r.arrivals[k - 1].t);
+  gaps.sort((a, b) => a - b);
+  const baseline = gaps.length ? gaps[Math.floor(gaps.length * 0.75)] : 400;
+
+  const spans = [];
+  for (const r of runs) {
+    const dur = r.end - r.start;
+    if (!r.arrivals.length) {
+      if (dur >= minMs && dur <= maxMs) spans.push({ start: r.start, end: r.end });
+      continue;
+    }
+    const first = r.arrivals[0].t - latency;
+    const last = r.arrivals[r.arrivals.length - 1].t - latency;
+    if (first - r.start >= edgeMs) spans.push({ start: r.start, end: Math.min(r.end, first - 100) });
+    if (r.end - (last + wordMs) >= edgeMs) spans.push({ start: last + wordMs, end: r.end });
+    for (let k = 1; k < r.arrivals.length; k++) {
+      const g = r.arrivals[k].t - r.arrivals[k - 1].t;
+      if (g >= baseline + 600) {
+        spans.push({ start: r.arrivals[k - 1].t - latency + wordMs, end: r.arrivals[k].t - latency - 100 });
+      }
+    }
+  }
+
+  // Hesitation sounds are low, voiced murmurs; breaths and clicks are hissy.
+  const hasBalance = levels.some((s) => Number.isFinite(s.lh));
+  const murmur = (sp) => {
+    if (!hasBalance) return true;
+    const inside = levels.filter((s) => s.t >= sp.start && s.t < sp.end && Number.isFinite(s.lh));
+    if (!inside.length) return true;
+    return inside.reduce((a, s) => a + s.lh, 0) / inside.length >= 0;
+  };
+  const found = spans
+    .map((s) => ({ ...s, duration: s.end - s.start }))
+    .filter((s) => s.duration >= minMs && s.duration <= maxMs && murmur(s))
+    .sort((a, b) => a.start - b.start);
+  return { count: found.length, spans: found };
+}
+
+/* ───────────── Pace ───────────── */
 
 /** Words-per-minute per time bucket, from a running word count. */
 export function paceBuckets(events, durationMs, bucketMs = 10000) {
@@ -211,19 +441,67 @@ export function pauseRating(ms) {
   return { label: 'Too long', tone: 'bad' };
 }
 
+/* ───────────── Tip ───────────── */
+
+const OPENER_WORDS = new Set(['so', 'well', 'okay', 'okay so', 'right', 'and yeah']);
+const HEDGES = new Set(['basically', 'essentially', 'effectively', 'actually', 'literally', 'honestly', 'obviously', 'just', 'really', 'very']);
+
+function adviceFor(phrase) {
+  if (OPENER_WORDS.has(phrase)) return 'Try pausing silently instead, then open with the point itself.';
+  if (HEDGES.has(phrase)) return 'Try cutting it; the sentence almost always works without it.';
+  return 'Try pausing silently instead.';
+}
+
+/** One-line coaching tip based on the biggest crutch. */
+export function crutchTip({ fillers, likelyUms, hesitations, openers }) {
+  const top = fillers.counts[0];
+  const ums = likelyUms ? likelyUms.count : 0;
+  const opener = openers.flagged[0];
+  const times = (n) => `${n} time${n === 1 ? '' : 's'}`;
+  if (top && top.count >= 3 && top.count >= ums) {
+    return `Your top crutch was “${top.phrase}” (${times(top.count)}). ${adviceFor(top.phrase)}`;
+  }
+  if (ums >= 3) {
+    return `Around ${ums} likely “um”s were cut from your transcript. When you need a moment, close your mouth and pause silently.`;
+  }
+  if (opener) {
+    return `${opener.count} sentences started with “${opener.word}”. Try opening each one with the point itself.`;
+  }
+  if (top && top.count >= 2) {
+    return `Your top crutch was “${top.phrase}” (${times(top.count)}). ${adviceFor(top.phrase)}`;
+  }
+  if (hesitations && hesitations.count >= 6) {
+    return `${hesitations.count} short hesitations. Sketch your two or three points before you start so the next idea is ready.`;
+  }
+  return 'No single crutch stood out. Keep doing what you’re doing.';
+}
+
+/* ───────────── Everything together ───────────── */
+
 /**
- * Run the full analysis.
- * input: { transcript, durationMs, levels: [{t, db}], events: [{t, words}], fillers }
+ * input: { segments: [{text}], transcript?, durationMs, levels: [{t, db, lh}],
+ *          events: [{t, words}], fillers }
  */
-export function analyseSpeech({ transcript, durationMs, levels, events, fillers }) {
-  const tokens = tokenize(transcript);
+export function analyseSpeech({ segments, transcript, durationMs, levels = [], events = [], fillers }) {
+  const joined = segments ? joinSegments(segments) : { text: transcript || '', offsets: [] };
+  const text = joined.text;
+  const tokens = tokenize(text);
   const wordCount = tokens.length;
-  const fill = countFillers(transcript, fillers);
 
   const pauses =
     analysePausesFromLevels(levels, durationMs) ||
     analysePausesFromEvents(events, durationMs) ||
     { source: 'none', firstSpeech: 0, lastSpeech: durationMs, pauses: [], longest: null, runs: null };
+
+  // Line recogniser output up with the audio: which words follow a pause,
+  // and which voiced sounds never became words.
+  const alignment = alignWordsToAudio(events, pauses);
+  const pauseBefore = wordsAfterPause(alignment);
+
+  const fill = countFillers(text, fillers, { startOffsets: joined.offsets, pauseBefore });
+  const openers = repeatedOpeners(text, joined.offsets);
+  const hesitations = pauses.source === 'audio' ? findHesitations(pauses) : null;
+  const likelyUms = estimateLikelyUms(levels, alignment);
 
   // Pace is measured over the time you were actually talking (first sound to last),
   // so a slow start or finishing a few seconds early doesn't skew it.
@@ -234,8 +512,9 @@ export function analyseSpeech({ transcript, durationMs, levels, events, fillers 
   const fillersPerMin = wordCount ? fill.total / speakingMin : 0;
   const longPauses = pauses.pauses.filter((p) => p.duration >= 2000).length;
 
-  return {
-    transcript,
+  const stats = {
+    transcript: text,
+    segmentOffsets: joined.offsets,
     wordCount,
     durationMs,
     speakingMs,
@@ -244,6 +523,10 @@ export function analyseSpeech({ transcript, durationMs, levels, events, fillers 
     fillers: fill,
     fillersPerMin,
     fillerRating: fillerRating(fillersPerMin),
+    likelyUms,
+    hesitations,
+    openers,
+    latencyMs: alignment ? alignment.latency : null,
     pauses,
     longestPauseMs: pauses.longest ? pauses.longest.duration : null,
     longPauses,
@@ -251,4 +534,6 @@ export function analyseSpeech({ transcript, durationMs, levels, events, fillers 
     timeToFirstWordMs: pauses.source === 'none' ? null : pauses.firstSpeech,
     paceBuckets: paceBuckets(events, durationMs),
   };
+  stats.tip = crutchTip(stats);
+  return stats;
 }

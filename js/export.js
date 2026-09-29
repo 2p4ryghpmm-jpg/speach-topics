@@ -5,7 +5,7 @@ import { fmtClock } from './timer.js';
 
 const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
 
-function row(label, value, width = 22) {
+function row(label, value, width = 24) {
   return `${label} ${'.'.repeat(Math.max(2, width - label.length))} ${value}`;
 }
 
@@ -50,8 +50,26 @@ export function buildTranscript({ topic, categoryLabel, modeLine, date, notes, s
   L.push(row('Words spoken', String(stats.wordCount)));
   L.push(row('Pace', `${stats.wpm} words/min (${stats.pace.label.toLowerCase()})`));
   L.push(row('Speaking time', fmtClock(stats.speakingMs, { ceil: false })));
-  L.push(row('Filler words', `${stats.fillers.total} (${stats.fillersPerMin.toFixed(1)} per min)`));
-  for (const f of stats.fillers.counts) L.push(`    - "${f.phrase}" × ${f.count}`);
+  L.push(row('Filler words (text)', `${stats.fillers.total} (${stats.fillersPerMin.toFixed(1)} per min)`));
+  if (stats.fillers.counts.length) {
+    L.push(wrap(stats.fillers.counts.map((f) => `${f.phrase} ×${f.count}${f.possible ? ' (possible)' : ''}`).join(', '), 70)
+      .split('\n').map((l) => `    ${l}`).join('\n'));
+  }
+  const at = (ms) => fmtClock(Math.round(ms / 1000) * 1000);
+  const ums = stats.likelyUms;
+  L.push(row('Likely um/uh', ums
+    ? `${ums.count} (ESTIMATED: voiced sounds Chrome returned no words for)`
+    : 'unavailable (needs clear microphone audio)'));
+  if (ums && ums.count) L.push(`    at ${ums.spans.map((u) => `${at(u.start)} (${secs(u.duration)})`).join(', ')}`);
+  const hes = stats.hesitations;
+  L.push(row('Hesitations', hes
+    ? `${hes.count}${hes.count ? `, avg ${secs(hes.avgMs)}` : ''} (ESTIMATED: silent gaps of 0.4-2 s mid-speech)`
+    : 'unavailable (needs clear microphone audio)'));
+  if (hes && hes.count) L.push(`    at ${hes.gaps.map((g) => `${at(g.start)} (${secs(g.duration)})`).join(', ')}`);
+  const op = stats.openers;
+  L.push(row('Repeated openers', op.flagged.length
+    ? op.flagged.map((f) => `"${f.word}" started ${f.count} of ${op.sentences} sentences`).join('; ')
+    : `none (no word starts 3+ of ${op.sentences} sentences)`));
   if (stats.longestPauseMs != null) {
     L.push(row('Longest pause', `${secs(stats.longestPauseMs)} (at ${fmtClock(Math.round(stats.pauses.longest.start / 1000) * 1000)})`));
   } else {
@@ -63,6 +81,13 @@ export function buildTranscript({ topic, categoryLabel, modeLine, date, notes, s
   if (paced.length > 1) {
     L.push(row('Pace by 10 s', paced.map((b) => b.wpm).join(' · ') + ' wpm'));
   }
+  L.push(row('Pause detection', stats.pauses.source === 'audio'
+    ? 'microphone audio levels'
+    : stats.pauses.source === 'recognition'
+      ? 'recognition timing (fallback; misses pauses under ~1 s)'
+      : 'not enough audio'));
+  L.push('');
+  L.push(wrap(`TIP: ${stats.tip}`));
   if (notes && notes.trim()) {
     L.push('');
     L.push('MY PREP NOTES');

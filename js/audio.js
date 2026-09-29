@@ -81,7 +81,6 @@ export class MicMonitor {
     this.stream = null;
     this.analyser = null;
     this.freq = null;
-    this.time = null;
     this.samples = [];
     this.t0 = 0;
     this.recording = false;
@@ -89,32 +88,52 @@ export class MicMonitor {
 
   async open() {
     ensureAudio();
+    // Auto-gain is off: it pumps up room noise during pauses, which hides them.
     this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
     });
     const src = ctx.createMediaStreamSource(this.stream);
+
+    // Smoothed analyser for the visualiser.
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0.72;
     src.connect(this.analyser);
-    this.source = src;
     this.freq = new Uint8Array(this.analyser.frequencyBinCount);
-    this.time = new Float32Array(this.analyser.fftSize);
+
+    // Unsmoothed analyser for voice-activity detection.
+    this.vad = ctx.createAnalyser();
+    this.vad.fftSize = 2048;
+    this.vad.smoothingTimeConstant = 0;
+    src.connect(this.vad);
+    this.spec = new Float32Array(this.vad.frequencyBinCount);
+    const bin = (hz) => Math.min(this.spec.length, Math.max(1, Math.round(hz / (ctx.sampleRate / this.vad.fftSize))));
+    this.bands = {
+      voice: [bin(250), bin(4000)], // where speech energy lives
+      low: [bin(80), bin(1000)], // vowels and "mmm" murmurs
+      high: [bin(1000), bin(4000)], // hiss: breaths, fricatives, clicks
+    };
+    this.source = src;
   }
 
   /**
-   * Current level in dBFS (roughly -100 … 0), or null for a dropout.
-   * A real microphone never reads as near-digital-silence, so buffers
-   * below -100 dBFS are glitches (device hiccups, muted input) and are
-   * skipped rather than mistaken for a pause.
+   * Speech-band level in dB, plus low-vs-high spectral balance (dB).
+   * Near-silent input reads as a very low level rather than being skipped,
+   * so a quiet pause is always counted as a pause.
    */
-  level() {
-    if (!this.analyser) return null;
-    this.analyser.getFloatTimeDomainData(this.time);
-    let sum = 0;
-    for (let i = 0; i < this.time.length; i++) sum += this.time[i] * this.time[i];
-    const rms = Math.sqrt(sum / this.time.length);
-    return rms > 1e-5 ? 20 * Math.log10(rms) : null;
+  measure() {
+    if (!this.vad) return null;
+    this.vad.getFloatFrequencyData(this.spec);
+    const power = ([a, b]) => {
+      let p = 0;
+      for (let i = a; i < b; i++) {
+        const v = this.spec[i];
+        if (v > -200) p += 10 ** (v / 10);
+      }
+      return p;
+    };
+    const db = (p) => (p > 0 ? 10 * Math.log10(p) : -140);
+    return { db: db(power(this.bands.voice)), lh: db(power(this.bands.low)) - db(power(this.bands.high)) };
   }
 
   /** Fill and return the frequency buffer (0–255 per bin). */
@@ -131,9 +150,9 @@ export class MicMonitor {
 
   /** Call regularly (the app drives this from its ticker). */
   sample(now) {
-    if (!this.recording || !this.analyser) return;
-    const db = this.level();
-    if (db != null) this.samples.push({ t: now - this.t0, db });
+    if (!this.recording) return;
+    const m = this.measure();
+    if (m) this.samples.push({ t: now - this.t0, db: m.db, lh: m.lh });
   }
 
   stopRecording() {
@@ -147,6 +166,7 @@ export class MicMonitor {
     if (this.source) this.source.disconnect();
     this.stream = null;
     this.analyser = null;
+    this.vad = null;
     this.source = null;
   }
 }

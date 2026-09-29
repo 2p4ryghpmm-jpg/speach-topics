@@ -6,44 +6,47 @@
  */
 
 /*
- * Filler words & phrases counted in the speech analysis.
+ * Filler words & phrases counted from the transcript.
+ * Matching is case-insensitive and whole-word; multi-word phrases are matched
+ * first, so "okay so" never also counts as "so".
  *
- *  • A plain string counts every occurrence:            'basically'
- *  • Multi-word phrases work too:                       'you know'
- *  • Use an object with `ignoreAfter` to skip uses that are
- *    clearly not fillers, based on the word right before it:
- *        { phrase: 'like', ignoreAfter: ['looks', 'something'] }
- *    ("looks like a wave" is not a filler; "it's, like, a wave" is.)
+ *  • A plain string is counted every time:              'basically'
+ *  • Add `when` for words that are only fillers in some contexts:
+ *      when: 'opener'  only at the start of a sentence, or right after a
+ *                      pause of 0.3 s or more ("So, the key idea…")
+ *      when: 'like'    only when "like" isn't introducing a noun phrase or used
+ *                      as a verb ("behaves like a wave" and "I like it" don't count)
+ *  • `possible: true` still counts, but is labelled "possible filler".
+ *  • `ignoreAfter` skips uses that follow certain words ("what kind of").
  *
- * Note: Chrome's speech recogniser sometimes drops "um"/"uh" from the
- * transcript entirely, so treat those counts as a minimum.
+ * Chrome's recogniser deletes most "um"/"uh" sounds before we ever see them.
+ * Those are estimated from the audio instead (see "Likely um/uh" in results).
  */
 export const FILLER_WORDS = [
+  // Hedges and intensifiers: counted every time.
+  'basically', 'essentially', 'effectively', 'actually', 'literally',
+  'honestly', 'obviously', 'really', 'very',
+
+  // Phrases.
+  'i mean', 'okay so', 'and yeah',
+  { phrase: 'you know', ignoreAfter: ['do', 'did', "don't", "didn't", 'if', 'when', 'what', 'once', 'that', 'whether'] },
+  { phrase: 'kind of', ignoreAfter: ['a', 'the', 'what', 'this', 'that', 'some', 'any', 'one', 'every', 'same', 'which', 'different', 'each'] },
+  { phrase: 'sort of', ignoreAfter: ['a', 'the', 'what', 'this', 'that', 'some', 'any', 'one', 'every', 'same', 'which', 'different', 'each'] },
+
+  // Only fillers at the start of a sentence or after a pause.
+  { phrase: 'so', when: 'opener' },
+  { phrase: 'well', when: 'opener' },
+  { phrase: 'okay', when: 'opener' },
+  { phrase: 'right', when: 'opener' },
+
+  // "like" unless it introduces a noun phrase or is the verb.
+  { phrase: 'like', when: 'like' },
+
+  // Often legitimate ("just enough energy"), so flagged as possible.
+  { phrase: 'just', possible: true },
+
+  // Rarely survive Chrome's transcription, but counted if they do.
   'um', 'umm', 'uh', 'uhh', 'er', 'erm', 'hmm',
-  {
-    phrase: 'like',
-    ignoreAfter: [
-      'looks', 'look', 'looked', 'looking', 'seems', 'seem', 'seemed',
-      'sounds', 'sound', 'feel', 'feels', 'felt', 'something', 'things',
-      'stuff', 'just', 'more', 'less', 'behaves', 'behave', 'behaving',
-      'acts', 'act', 'would', 'i', 'we', 'they', "don't", "didn't",
-      'exactly', 'much', 'very', 'not', 'nothing', 'anything', 'shaped',
-    ],
-  },
-  {
-    phrase: 'you know',
-    ignoreAfter: ['do', 'did', "don't", "didn't", 'if', 'when', 'what', 'once', 'that', 'whether'],
-  },
-  {
-    phrase: 'sort of',
-    ignoreAfter: ['a', 'the', 'what', 'this', 'that', 'some', 'any', 'one', 'every', 'same', 'which', 'different', 'each'],
-  },
-  {
-    phrase: 'kind of',
-    ignoreAfter: ['a', 'the', 'what', 'this', 'that', 'some', 'any', 'one', 'every', 'same', 'which', 'different', 'each'],
-  },
-  'basically',
-  'actually',
 ];
 
 /* Topic categories and their draw weights (must add up to 100). */
